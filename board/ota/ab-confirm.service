@@ -1,0 +1,14 @@
+[Unit]
+Description=A/B boot confirm (mark the current slot good on a healthy boot)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+# settle before confirming, so a slot that boots but immediately falls over
+# does not get confirmed
+ExecStartPre=/bin/sleep 15
+ExecStart=/usr/local/sbin/ab-confirm.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
