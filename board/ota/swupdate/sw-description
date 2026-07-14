@@ -1,0 +1,11 @@
+{
+  "software": {
+    "version": "0.2.0",
+    "scripts": [
+      {
+        "filename": "update.sh",
+        "type": "shellscript"
+      }
+    ]
+  }
+}
