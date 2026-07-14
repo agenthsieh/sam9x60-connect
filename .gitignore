@@ -1,0 +1,33 @@
+# Build artifacts / images (never commit — deliver via releases)
+*.itb
+*.img
+*.bin
+*.cpio
+*.cpio.gz
+*.tar
+*.tar.gz
+*.tgz
+*.swu
+zImage
+Image
+*.dtb
+*.dtbo
+output/
+build/
+
+# Secrets / local config — must never be committed
+*.pem
+*.key
+id_*
+*credentials*
+*.secret
+wpa_supplicant.conf
+fw_env.config
+.env
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+__pycache__/
+*.pyc
