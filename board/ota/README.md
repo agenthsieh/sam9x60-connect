@@ -4,6 +4,10 @@ Redundant **A/B rootfs** on the SD card with **automatic rollback**, driven by t
 U-Boot environment. Needs nothing more exotic than a scriptable U-Boot env — it
 even works on a U-Boot built *without* `setexpr`.
 
+> When the SD card itself is blank or broken, the A/B scheme has nothing to fall
+> back to. That last-resort case is handled by the **[QSPI recovery installer
+> (M2)](recovery/README.md)**, which boots from flash and can reinstall the system.
+
 ## Partition layout
 
 ```
