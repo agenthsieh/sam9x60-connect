@@ -17,13 +17,33 @@ NAS has. So: board data stays off Wi-Fi, over a link every host supports.
 | file | role |
 |------|------|
 | [`usbserial-up.sh`](usbserial-up.sh) | `modprobe g_serial use_acm=1` → `/dev/ttyGS0`, a CDC-ACM gadget |
-| [`usb_serial_status.py`](usb_serial_status.py) | every 2 s, write `{"ts","sysinfo","hr"}` to `/dev/ttyGS0` (non-blocking; reuses the board's own `:8080` API) |
-| [`usbserial.service`](usbserial.service) | systemd unit; `Conflicts=usbnet.service` |
+| [`usb_serial_agent.py`](usb_serial_agent.py) | **bidirectional** agent: streams telemetry out *and* accepts a file push (e.g. a `.swu`) + applies it with SWUpdate |
+| [`usb_serial_status.py`](usb_serial_status.py) | telemetry-only predecessor (kept for reference) |
+| [`usbserial.service`](usbserial.service) | systemd unit (runs the agent); `Conflicts=usbnet.service` |
+
+## Push protocol
+
+Newline-delimited JSON control messages, each optionally followed by a fixed
+number of raw bytes. USB bulk transfer is reliable and in-order, so there's no
+per-chunk retransmit — a final CRC32 catches corruption.
+
+```
+host → board  {"t":"put","name":"x.swu","size":S,"crc":C}  + S raw bytes
+              {"t":"apply","name":"x.swu"}
+board → host  {"t":"tel",…}            telemetry (every 2 s)
+              {"t":"progress","recv":X,"size":S}
+              {"t":"put_result","ok":bool,"crc":C}
+              {"t":"apply_result","ok":bool,"msg":"…"}
+```
+
+The received file lands in `GS_SPOOL` (default `/tmp/ota`); `apply` runs
+`swupdate -i <file>`, so a real `.swu` writes the inactive A/B slot and arms the
+switch (see [`../ota/`](../ota/)).
 
 ## Install (board)
 
 ```sh
-cp usb_serial_status.py /root/
+cp usb_serial_agent.py /root/
 cp usbserial-up.sh /usr/local/sbin/ && chmod +x /usr/local/sbin/usbserial-up.sh
 cp usbserial.service /etc/systemd/system/
 systemctl disable --now usbnet          # release the g_ether gadget

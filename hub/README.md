@@ -79,14 +79,26 @@ over SSH with `sudo docker compose ...`.
 Serial mode maps the device into the container and runs it as root (the
 CDC-ACM node is root-owned on the host) — see `docker-compose.yml`.
 
+## Push a `.swu` over USB
+
+In serial mode the dashboard shows a **"Push update (.swu) over USB"** card:
+pick a `.swu`, optionally tick *apply after transfer*, and it streams straight
+to the board over the CDC-ACM link (progress bar from the board's acks). With
+*apply*, the board runs SWUpdate on it — writing the inactive A/B slot — with no
+network involved. Verified end-to-end (512 KB transfer, CRC match; SWUpdate
+invoked and its result surfaced).
+
 ## Endpoints
 
 - `GET /` — dashboard (auto-refreshes every 3 s)
 - `GET /api/status` — aggregated JSON (`conn`, `sysinfo`, `hr`, `board`, `age`)
+- `GET /api/history` — recent telemetry points for the chart
+- `POST /api/ota?name=<f>&apply=<0|1>` — raw `.swu` body → stream to board
+- `GET /api/ota/status` — transfer/apply progress (`phase`, `sent`, `recv`, `ok`, `msg`)
 - `GET /healthz` — container healthcheck
 
 ## Roadmap (M3/M4)
 
-- Push a `.swu` to the board straight from the dashboard (OTA button).
+- ~~Push a `.swu` to the board over USB~~ — done (serial file transfer + apply).
 - Blank-SD provisioning wizard driven from the installer.
 - MQTT telemetry ingest (temp / heart rate) for history + charts (M4).

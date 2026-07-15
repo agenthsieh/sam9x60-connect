@@ -25,7 +25,7 @@ Config via env:
   STALE_AFTER     seconds without data -> offline    (default 8)
   HUB_PORT        port this hub listens on           (default 8091)
 """
-import os, json, time, threading, socketserver, termios, urllib.request, urllib.error
+import os, json, time, zlib, threading, socketserver, termios, urllib.request, urllib.error
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -105,8 +105,60 @@ def poll_loop():
         time.sleep(POLL_INTERVAL)
 
 
+# --- shared CDC-ACM fd (one reader loop + the OTA sender write to it) --------
+_ser_fd = None
+_ser_wlock = threading.Lock()
+_ota = {"active": False, "name": None, "size": 0, "sent": 0, "recv": 0,
+        "phase": "idle", "ok": None, "msg": ""}   # phase: idle|send|apply|done|error
+
+
+def _ser_write(obj):
+    fd = _ser_fd
+    if fd is None:
+        raise OSError("serial not open")
+    with _ser_wlock:
+        os.write(fd, (json.dumps(obj, separators=(",", ":")) + "\n").encode())
+
+
+def _ser_write_raw(data):
+    fd = _ser_fd
+    if fd is None:
+        raise OSError("serial not open")
+    with _ser_wlock:
+        mv = memoryview(data)
+        off = 0
+        while off < len(mv):
+            off += os.write(fd, mv[off:])       # blocks on USB flow control
+
+
+def _dispatch(obj):
+    t = obj.get("t")
+    if t in (None, "tel"):                       # telemetry (tagged or bare)
+        now = time.time()
+        with _lock:
+            _state.update(conn="ready", sysinfo=obj.get("sysinfo"),
+                          hr=obj.get("hr"), last_ok=now, checked=now)
+        _record(obj.get("sysinfo"), obj.get("hr"))
+    elif t == "progress":
+        with _lock:
+            _ota["recv"] = obj.get("recv", 0)
+    elif t == "put_result":
+        with _lock:
+            _ota["recv"] = _ota["size"] if obj.get("ok") else _ota["recv"]
+            if not obj.get("ok"):
+                _ota.update(phase="error", ok=False, active=False,
+                            msg=obj.get("err") or "put failed")
+            _ota["_put_ok"] = bool(obj.get("ok"))
+    elif t == "apply_result":
+        with _lock:
+            _ota.update(phase="done" if obj.get("ok") else "error",
+                        ok=bool(obj.get("ok")), active=False,
+                        msg=obj.get("msg", ""))
+
+
 def serial_loop():
-    """Read newline-delimited JSON telemetry from the board's CDC-ACM gadget."""
+    """Own the CDC-ACM fd: raw-read and dispatch newline-delimited JSON."""
+    global _ser_fd
     while True:
         try:
             fd = os.open(SERIAL_DEV, os.O_RDWR | os.O_NOCTTY)
@@ -117,29 +169,62 @@ def serial_loop():
                 termios.tcsetattr(fd, termios.TCSANOW, a)
             except Exception:
                 pass
+            _ser_fd = fd
             buf = b""
             while True:
-                chunk = os.read(fd, 512)
+                chunk = os.read(fd, 4096)
                 if not chunk:
                     continue
                 buf += chunk
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
                     try:
-                        obj = json.loads(raw.decode("utf-8", "replace"))
+                        _dispatch(json.loads(raw.decode("utf-8", "replace")))
                     except ValueError:
                         continue
-                    now = time.time()
-                    with _lock:
-                        _state.update(conn="ready", sysinfo=obj.get("sysinfo"),
-                                      hr=obj.get("hr"), last_ok=now, checked=now)
-                    _record(obj.get("sysinfo"), obj.get("hr"))
-                if len(buf) > 65536:
+                if len(buf) > 131072:
                     buf = b""                    # runaway guard on a garbled link
         except Exception:
+            _ser_fd = None
             with _lock:
                 _state["checked"] = time.time()
             time.sleep(2)                        # device gone; retry open
+
+
+def serial_send_file(data, name, apply_after):
+    """Stream a file to the board over serial, then optionally apply it."""
+    crc = zlib.crc32(data) & 0xffffffff
+    with _lock:
+        _ota.update(active=True, name=name, size=len(data), sent=0, recv=0,
+                    phase="send", ok=None, msg="", _put_ok=None)
+    _ser_write({"t": "put", "name": name, "size": len(data), "crc": crc})
+    CH = 4096
+    for i in range(0, len(data), CH):
+        _ser_write_raw(data[i:i + CH])
+        with _lock:
+            _ota["sent"] = min(i + CH, len(data))
+    # wait for the board's put_result
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        with _lock:
+            po = _ota.get("_put_ok")
+        if po is not None:
+            break
+        time.sleep(0.1)
+    with _lock:
+        po = _ota.get("_put_ok")
+    if not po:
+        with _lock:
+            _ota.update(phase="error", ok=False, active=False,
+                        msg=_ota.get("msg") or "transfer failed/timed out")
+        return
+    if apply_after:
+        with _lock:
+            _ota.update(phase="apply")
+        _ser_write({"t": "apply", "name": name})   # result arrives via _dispatch
+    else:
+        with _lock:
+            _ota.update(phase="done", ok=True, active=False, msg="received")
 
 
 def stale_watchdog():
@@ -185,7 +270,37 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 pts = list(_history)
             return self._send(200, json.dumps({"points": pts}), "application/json")
+        if self.path == "/api/ota/status":
+            with _lock:
+                o = {k: v for k, v in _ota.items() if not k.startswith("_")}
+            return self._send(200, json.dumps(o), "application/json")
         return self._send(404, json.dumps({"err": "not found"}), "application/json")
+
+    def do_POST(self):
+        # POST /api/ota?name=<f>&apply=1  with the raw file as the request body.
+        if self.path.split("?")[0] != "/api/ota":
+            return self._send(404, json.dumps({"err": "not found"}), "application/json")
+        if not SERIAL_DEV or _ser_fd is None:
+            return self._send(409, json.dumps({"err": "serial link not available"}), "application/json")
+        with _lock:
+            busy = _ota["active"]
+        if busy:
+            return self._send(409, json.dumps({"err": "transfer already in progress"}), "application/json")
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        name = os.path.basename(q.get("name", ["upload.swu"])[0]) or "upload.swu"
+        apply_after = q.get("apply", ["0"])[0] in ("1", "true", "yes")
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return self._send(400, json.dumps({"err": "empty body"}), "application/json")
+        data = self.rfile.read(n)
+        threading.Thread(target=serial_send_file, args=(data, name, apply_after),
+                         daemon=True).start()
+        return self._send(202, json.dumps({"accepted": True, "name": name,
+                          "size": len(data), "apply": apply_after}), "application/json")
 
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -215,6 +330,15 @@ h1{font-size:19px;margin:0 0 2px}.sub{color:var(--mut);font-size:13px;margin-bot
 .chart{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-top:12px}
 .chart .k{margin-bottom:8px}.chart svg{display:block;width:100%;height:120px;overflow:visible}
 .chart .cur{fill:var(--fg);font-size:13px;font-weight:600}.chart .ax{fill:var(--mut);font-size:11px}
+.ota{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-top:12px}
+.ota h3{margin:0 0 10px;font-size:15px}.ota .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.ota input[type=file]{color:var(--mut);font-size:13px;max-width:100%}
+.ota label{color:var(--mut);font-size:13px}
+.ota button{background:var(--acc);color:#04203f;border:0;border-radius:7px;padding:8px 14px;font-weight:600;cursor:pointer}
+.ota button:disabled{opacity:.5;cursor:default}
+.bar{height:8px;background:#0d0f14;border-radius:5px;overflow:hidden;margin-top:10px}
+.bar>div{height:100%;width:0;background:var(--acc);transition:width .2s}
+.ota .st{color:var(--mut);font-size:12px;margin-top:6px}
 .guide{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-top:14px}
 .guide h3{margin:0 0 8px;font-size:15px}.guide code{background:#0d0f14;padding:2px 6px;border-radius:5px;
   color:var(--acc);font-size:13px}.guide ol{margin:8px 0 0 18px;padding:0}.guide li{margin:4px 0}
@@ -224,6 +348,7 @@ h1{font-size:19px;margin:0 0 2px}.sub{color:var(--mut);font-size:13px;margin-bot
 <div class="sub" id="sub">connecting…</div>
 <div class="banner b-unknown" id="banner"><span class="dot"></span><span id="btext">…</span></div>
 <div id="body"></div>
+<div id="ota"></div>
 <div class="foot" id="foot"></div>
 </div>
 <script>
@@ -259,6 +384,7 @@ async function tick(){
  b.className='banner b-'+st.conn;
  const src=st.board.source||st.board.host||'?';
  const transport=st.board.transport||'http';
+ renderOta(transport);
  const host=st.board.host||src;
  if(st.conn==='ready'){
    const s=st.sysinfo||{},hr=st.hr||{};
@@ -293,6 +419,36 @@ async function tick(){
  }else{$('btext').textContent='connecting…';}
  $('sub').textContent=`${transport==='serial'?'USB serial':'HTTP'} · ${src}`;
  $('foot').textContent=`updated ${st.age}s ago · state "${st.conn}" · via ${transport}`;
+}
+function fmtB(n){n=n||0;return n>=1048576?(n/1048576).toFixed(1)+'MB':n>=1024?(n/1024|0)+'KB':n+'B';}
+let otaRendered=false;
+function renderOta(transport){
+ if(otaRendered||transport!=='serial')return; otaRendered=true;
+ $('ota').innerHTML=`<div class="ota"><h3>Push update (.swu) over USB</h3>
+   <div class="row">
+     <input type="file" id="swu" accept=".swu,.bin,.img">
+     <label><input type="checkbox" id="apply"> apply after transfer</label>
+     <button id="push">Push over USB</button>
+   </div>
+   <div class="bar"><div id="pbar"></div></div>
+   <div class="st" id="pst">idle</div></div>`;
+ $('push').onclick=pushSwu;
+}
+async function pushSwu(){
+ const f=$('swu').files[0]; if(!f){$('pst').textContent='pick a .swu first';return;}
+ $('push').disabled=true; $('pst').textContent='reading…';
+ const buf=await f.arrayBuffer();
+ try{await fetch(`/api/ota?name=${encodeURIComponent(f.name)}&apply=${$('apply').checked?1:0}`,{method:'POST',body:buf});}
+ catch(e){$('pst').textContent='upload failed';$('push').disabled=false;return;}
+ pollOta();
+}
+async function pollOta(){
+ let o;try{o=await (await fetch('/api/ota/status')).json()}catch(e){setTimeout(pollOta,600);return;}
+ const cur=o.phase==='send'?o.sent:o.recv, pct=o.size?Math.round(cur/o.size*100):0;
+ $('pbar').style.width=pct+'%';
+ const lbl={send:'sending',apply:'applying',done:'done ✓',error:'error',idle:'idle'}[o.phase]||o.phase;
+ $('pst').textContent=`${lbl} · ${fmtB(cur)}/${fmtB(o.size)}${o.msg?' · '+o.msg:''}`;
+ if(o.active) setTimeout(pollOta,500); else $('push').disabled=false;
 }
 const INSTALLER_PORT=%%INSTALLER_PORT%%;
 tick();setInterval(tick,3000);

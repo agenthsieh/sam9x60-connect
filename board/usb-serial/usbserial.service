@@ -6,7 +6,7 @@ Conflicts=usbnet.service
 
 [Service]
 ExecStartPre=/usr/local/sbin/usbserial-up.sh
-ExecStart=/usr/bin/python3 /root/usb_serial_status.py
+ExecStart=/usr/bin/python3 /root/usb_serial_agent.py
 Restart=always
 RestartSec=3
 
