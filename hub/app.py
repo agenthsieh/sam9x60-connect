@@ -139,6 +139,12 @@ def _dispatch(obj):
             _state.update(conn="ready", sysinfo=obj.get("sysinfo"),
                           hr=obj.get("hr"), last_ok=now, checked=now)
         _record(obj.get("sysinfo"), obj.get("hr"))
+    elif t == "inst":                            # recovery installer heartbeat
+        now = time.time()
+        with _lock:
+            _state.update(conn="installer", sysinfo=None, hr=None,
+                          last_ok=now, checked=now,
+                          installer={k: v for k, v in obj.items() if k != "t"})
     elif t == "progress":
         with _lock:
             _ota["recv"] = obj.get("recv", 0)
@@ -404,12 +410,15 @@ async function tick(){
    <div class="chart" id="chart"></div>`;
    drawChart();
  }else if(st.conn==='installer'){
-   $('btext').textContent='RECOVERY INSTALLER running — system not installed';
-   body.innerHTML=`<div class="guide"><h3>The board booted its QSPI recovery installer</h3>
-     <div>The SD card is blank or broken, so the board fell back to flash. Reinstall the system:</div>
-     <ol><li>Reach the installer's SWUpdate at <code>http://${host}:${INSTALLER_PORT}/</code></li>
-     <li>Upload a <code>.swu</code> system image</li>
-     <li>The board writes the SD card and reboots into the normal A/B system</li></ol></div>`;
+   const inst=st.installer||{};
+   const sd=inst.sd; const sdtxt=sd==='blank'?'blank / unprovisioned':sd==='ok'?'present':sd||'unknown';
+   $('btext').textContent='RECOVERY INSTALLER — provision the SD over USB';
+   body.innerHTML=`<div class="guide"><h3>Blank-SD wizard</h3>
+     <div>The board fell back to the QSPI recovery installer (SD: <code>${sdtxt}</code>).
+     Reinstall the system over the USB link — no network, no card reader:</div>
+     <ol><li>Below, pick the <b>provisioning <code>.swu</code></b> and tick <b>apply after transfer</b></li>
+     <li>Push it — the installer partitions the SD and writes bootloader + rootfs</li>
+     <li>On success it reboots into the normal A/B system</li></ol></div>`;
  }else if(st.conn==='offline'){
    $('btext').textContent='Board OFFLINE';
    body.innerHTML=`<div class="guide"><h3>No response from the board</h3>

@@ -1,38 +1,34 @@
 #!/bin/busybox sh
-# PID 1 for the QSPI recovery installer initramfs.
-# Shebang MUST be /bin/busybox (there is no /bin/sh yet — busybox --install
-# creates the applet symlinks below, but this script runs before that).
+# PID 1 for the QSPI recovery installer initramfs (USB-serial variant).
+# Shebang MUST be /bin/busybox (there is no /bin/sh yet).
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:$PATH
 /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t sysfs sysfs /sys 2>/dev/null
 /bin/busybox --install -s 2>/dev/null
-mkdir -p /tmp /www /mnt
+mkdir -p /tmp /mnt
 
 # LEDs off, then blue = "installer ready" (keep each ≤15 mA)
 for c in red green blue; do echo none > /sys/class/leds/$c/trigger 2>/dev/null; done
 
-echo ""; echo "=== SAM9X60 QSPI RECOVERY INSTALLER ==="
-/bin/busybox sleep 2
+echo ""; echo "=== SAM9X60 QSPI RECOVERY INSTALLER (serial) ==="
 
-# USB-gadget link. usb0 exists because USB_ETH is built into the recovery
-# kernel; no module load needed. No DHCP server here (busybox has no udhcpd) —
-# the host sets 192.168.9.2 statically, or a future build delivers the .swu
-# from a locally-mounted disk instead of over the network.
-/sbin/ip addr add 192.168.9.1/24 dev usb0 2>/dev/null
-/sbin/ip link set usb0 up 2>/dev/null
-echo "[installer] USB gadget: usb0 = 192.168.9.1  (host set 192.168.9.2, push .swu to :8090)"
-
-# SWUpdate web server for delivery (same engine as the A/B OTA half).
-/usr/bin/swupdate -v -w "-r /www -p 8090" -B none >/tmp/swupdate.log 2>&1 &
+# CDC-ACM gadget. The full recovery kernel has these as modules; load in order
+# (libcomposite is built in). use_acm=1 → the host binds it as /dev/ttyACM0.
+insmod /lib/modules/u_serial.ko 2>/dev/null
+insmod /lib/modules/usb_f_acm.ko 2>/dev/null
+insmod /lib/modules/usb_f_serial.ko 2>/dev/null
+insmod /lib/modules/g_serial.ko use_acm=1 2>/dev/null
+for i in 1 2 3 4 5; do [ -e /dev/ttyGS0 ] && break; sleep 1; done
 
 echo 0 > /sys/class/leds/red/brightness 2>/dev/null
-echo 0 > /sys/class/leds/green/brightness 2>/dev/null
 echo 1 > /sys/class/leds/blue/brightness 2>/dev/null
+echo "[installer] USB-serial ready on /dev/ttyGS0; push a provisioning .swu from the hub"
+echo "  >> manual return to SD: mount /dev/mmcblk0p1 /mnt && mv /mnt/boot.bin.off /mnt/boot.bin && sync && reboot -f"
 
-echo ""
-echo "  >> return to SD: mount /dev/mmcblk0p1 /mnt && mv /mnt/boot.bin.off /mnt/boot.bin && sync && reboot -f"
-echo ""
+# Serial agent handles telemetry-style heartbeat + file push + provisioning.
+# It reads /dev/ttyGS0; Ctrl-C on the ttyS0 console drops to the rescue shell.
+/sbin/installer-agent.sh
 
-# Interactive rescue shell on the serial console, forever.
+# agent exited -> interactive rescue shell on the serial console, forever
 while true; do /bin/busybox sh </dev/ttyS0 >/dev/ttyS0 2>&1; /bin/busybox sleep 1; done
