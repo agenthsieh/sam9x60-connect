@@ -78,6 +78,24 @@ recover without an SD-card reader, from the installer's own shell:
   → boots back to the A/B system
 ```
 
+## USB gadget must connect on boot, not just on a VBUS edge
+
+The atmel UDC connects to the host only on a **VBUS rising edge**. Since the
+board stays plugged into the host across a reboot, VBUS never drops — so the
+gadget loads but never enumerates, and the host sees nothing until a physical
+re-plug. `vbus_is_present()` returns 1 ("assume present") when there is *no*
+vbus GPIO, so the fix is to **drop `atmel,vbus-gpio`** from the gadget node in
+the recovery FIT's dtb — the UDC then connects whenever a gadget binds (i.e. on
+boot):
+
+```sh
+fdtput -d recovery.dtb /ahb/gadget@500000 atmel,vbus-gpio   # -> always-on UDC
+```
+
+Apply the same to the SD kernel FIT's base dtb so normal-system telemetry also
+survives a reboot. (Verified: the recovery installer enumerates on the host at
+boot with no re-plug once vbus-gpio is removed.)
+
 ## Known gaps (tracked for later)
 
 - **Host reachability of the gadget.** The installer has no DHCP server

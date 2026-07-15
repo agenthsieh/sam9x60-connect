@@ -24,7 +24,10 @@ sd_state() { [ -b /dev/mmcblk0p2 ] && echo ok || echo blank; }
 # heartbeat so the hub can tell the board is in installer mode
 ( while true; do printf '{"t":"inst","sd":"%s","ready":1}\n' "$(sd_state)" >&3; sleep 2; done ) &
 
-while IFS= read -r line <&3; do
+while true; do
+  # tolerate EOF/errors — the tty returns EOF when the host isn't attached yet;
+  # without this guard the loop would exit and drop to the rescue shell.
+  IFS= read -r line <&3 || { sleep 0.2; continue; }
   case "$line" in
     *'"t":"put"'*)
       size=$(printf '%s' "$line" | sed -n 's/.*"size":\([0-9]*\).*/\1/p')
