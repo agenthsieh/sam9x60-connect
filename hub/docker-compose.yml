@@ -1,0 +1,29 @@
+# SAM9X60 Connect — NAS Hub
+#
+# Copy .env.example to .env and set BOARD_HOST (default 192.168.9.1, the
+# USB-gadget link), then:
+#   docker compose up -d --build
+# Open http://<nas-ip>:8091/
+#
+# Reaching the board over the USB link (192.168.9.1): that address lives on the
+# host's USB-gadget interface, a host-local point-to-point link. The default
+# bridge below reaches it via the host route. If your host's firewall or OVS
+# setup blocks that, switch to host networking — uncomment `network_mode: host`
+# and drop the `ports:` block (the hub then binds HUB_PORT directly on the host).
+services:
+  hub:
+    build: .
+    image: sam9x60-hub:latest
+    container_name: sam9x60-hub
+    restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined      # Synology's kernel rejects Docker's seccomp profile
+    # network_mode: host        # <- use if the container can't reach 192.168.9.1
+    ports:
+      - "${HUB_PORT:-8091}:8091"
+    environment:
+      BOARD_HOST: "${BOARD_HOST:?set BOARD_HOST in .env}"
+      BOARD_PORT: "${BOARD_PORT:-8080}"
+      INSTALLER_PORT: "${INSTALLER_PORT:-8090}"
+      POLL_INTERVAL: "${POLL_INTERVAL:-3}"
+      HUB_PORT: "8091"
