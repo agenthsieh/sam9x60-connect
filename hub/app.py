@@ -10,20 +10,30 @@ is running, and "insert SD / check power" guidance when the board is dark.
 Zero third-party dependencies — Python stdlib only (same http.server stack the
 board itself uses), so the container image is tiny and needs no pip install.
 
+Two transports:
+  * USB serial (preferred) — the board streams JSON telemetry over a CDC-ACM
+    gadget; set SERIAL_DEV=/dev/ttyACM0. Keeps board data off Wi-Fi even on a
+    host (e.g. a Synology NAS) whose kernel can't do a USB-Ethernet gadget.
+  * HTTP poll — set BOARD_HOST to the board's IP; the hub polls its web API.
+
 Config via env:
-  BOARD_HOST      board IP / hostname            (required, e.g. 10.0.4.9)
-  BOARD_PORT      on-device web console port     (default 8080)
-  INSTALLER_PORT  recovery SWUpdate port         (default 8090)
-  POLL_INTERVAL   seconds between board polls    (default 3)
-  HUB_PORT        port this hub listens on       (default 8091)
+  SERIAL_DEV      CDC-ACM device e.g. /dev/ttyACM0  (enables serial mode)
+  BOARD_HOST      board IP / hostname               (HTTP mode)
+  BOARD_PORT      on-device web console port        (default 8080)
+  INSTALLER_PORT  recovery SWUpdate port            (default 8090)
+  POLL_INTERVAL   seconds between board polls        (default 3)
+  STALE_AFTER     seconds without data -> offline    (default 8)
+  HUB_PORT        port this hub listens on           (default 8091)
 """
-import os, json, time, threading, socketserver, urllib.request, urllib.error
+import os, json, time, threading, socketserver, termios, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+SERIAL_DEV     = os.environ.get("SERIAL_DEV", "").strip()
 BOARD_HOST     = os.environ.get("BOARD_HOST", "").strip()
 BOARD_PORT     = int(os.environ.get("BOARD_PORT", "8080"))
 INSTALLER_PORT = int(os.environ.get("INSTALLER_PORT", "8090"))
 POLL_INTERVAL  = float(os.environ.get("POLL_INTERVAL", "3"))
+STALE_AFTER    = float(os.environ.get("STALE_AFTER", "8"))
 HUB_PORT       = int(os.environ.get("HUB_PORT", "8091"))
 
 _state = {
@@ -32,7 +42,9 @@ _state = {
     "hr": None,            # last /api/hr/data payload
     "last_ok": 0,
     "checked": 0,
-    "board": {"host": BOARD_HOST, "port": BOARD_PORT},
+    "board": {"transport": "serial" if SERIAL_DEV else "http",
+              "source": SERIAL_DEV or f"{BOARD_HOST}:{BOARD_PORT}",
+              "host": BOARD_HOST, "port": BOARD_PORT},
 }
 _lock = threading.Lock()
 
@@ -73,6 +85,51 @@ def poll_loop():
             else:
                 _state.update(conn="offline", sysinfo=None, hr=None)
         time.sleep(POLL_INTERVAL)
+
+
+def serial_loop():
+    """Read newline-delimited JSON telemetry from the board's CDC-ACM gadget."""
+    while True:
+        try:
+            fd = os.open(SERIAL_DEV, os.O_RDWR | os.O_NOCTTY)
+            try:
+                a = termios.tcgetattr(fd)
+                a[0] = a[1] = a[3] = 0           # raw: no in/out/local processing
+                a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+                termios.tcsetattr(fd, termios.TCSANOW, a)
+            except Exception:
+                pass
+            buf = b""
+            while True:
+                chunk = os.read(fd, 512)
+                if not chunk:
+                    continue
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    try:
+                        obj = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    now = time.time()
+                    with _lock:
+                        _state.update(conn="ready", sysinfo=obj.get("sysinfo"),
+                                      hr=obj.get("hr"), last_ok=now, checked=now)
+                if len(buf) > 65536:
+                    buf = b""                    # runaway guard on a garbled link
+        except Exception:
+            with _lock:
+                _state["checked"] = time.time()
+            time.sleep(2)                        # device gone; retry open
+
+
+def stale_watchdog():
+    """Flag offline when no telemetry line has arrived for STALE_AFTER seconds."""
+    while True:
+        time.sleep(POLL_INTERVAL)
+        with _lock:
+            if _state["last_ok"] and time.time() - _state["last_ok"] > STALE_AFTER:
+                _state.update(conn="offline", checked=time.time())
 
 
 class HubServer(ThreadingHTTPServer):
@@ -152,10 +209,12 @@ async function tick(){
  let st;try{st=await (await fetch('/api/status')).json()}catch(e){return}
  const b=$('banner'),body=$('body');
  b.className='banner b-'+st.conn;
- const host=st.board.host||'(BOARD_HOST unset)';
+ const src=st.board.source||st.board.host||'?';
+ const transport=st.board.transport||'http';
+ const host=st.board.host||src;
  if(st.conn==='ready'){
    const s=st.sysinfo||{},hr=st.hr||{};
-   $('btext').textContent=`Board READY — ${s.hostname||host}`;
+   $('btext').textContent=`Board READY — ${s.hostname||src}`;
    const leds=s.leds||{};
    const ledhtml=['red','green','blue'].map(c=>`<span class="led ${c} ${leds[c]&&leds[c]!=='off'?'on':''}"></span>`).join('');
    body.innerHTML=`<div class="grid">
@@ -182,8 +241,8 @@ async function tick(){
      <ol><li>Power / USB cable</li><li>Insert a provisioned SD card (or let the QSPI installer come up)</li>
      <li>Wi-Fi join — confirm the board got a LAN IP</li></ol></div>`;
  }else{$('btext').textContent='connecting…';}
- $('sub').textContent=`watching ${host}:${st.board.port}`;
- $('foot').textContent=`last poll ${st.age}s ago · state "${st.conn}"`;
+ $('sub').textContent=`${transport==='serial'?'USB serial':'HTTP'} · ${src}`;
+ $('foot').textContent=`updated ${st.age}s ago · state "${st.conn}" · via ${transport}`;
 }
 const INSTALLER_PORT=%%INSTALLER_PORT%%;
 tick();setInterval(tick,3000);
@@ -192,6 +251,12 @@ PAGE = PAGE.replace("%%INSTALLER_PORT%%", str(INSTALLER_PORT))
 
 
 if __name__ == "__main__":
-    threading.Thread(target=poll_loop, daemon=True).start()
-    print(f"hub on :{HUB_PORT}, watching {BOARD_HOST}:{BOARD_PORT}", flush=True)
+    if SERIAL_DEV:
+        threading.Thread(target=serial_loop, daemon=True).start()
+        threading.Thread(target=stale_watchdog, daemon=True).start()
+        src = f"serial {SERIAL_DEV}"
+    else:
+        threading.Thread(target=poll_loop, daemon=True).start()
+        src = f"http {BOARD_HOST}:{BOARD_PORT}"
+    print(f"hub on :{HUB_PORT}, source {src}", flush=True)
     HubServer(("0.0.0.0", HUB_PORT), Handler).serve_forever()

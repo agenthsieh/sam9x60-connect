@@ -1,0 +1,14 @@
+[Unit]
+Description=SAM9X60 USB-serial (CDC-ACM) status link
+# Replaces usbnet.service on hosts that can't do a USB-Ethernet gadget.
+After=network.target ledweb.service
+Conflicts=usbnet.service
+
+[Service]
+ExecStartPre=/usr/local/sbin/usbserial-up.sh
+ExecStart=/usr/bin/python3 /root/usb_serial_status.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
