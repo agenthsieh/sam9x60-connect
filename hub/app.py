@@ -26,6 +26,7 @@ Config via env:
   HUB_PORT        port this hub listens on           (default 8091)
 """
 import os, json, time, threading, socketserver, termios, urllib.request, urllib.error
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SERIAL_DEV     = os.environ.get("SERIAL_DEV", "").strip()
@@ -47,6 +48,21 @@ _state = {
               "host": BOARD_HOST, "port": BOARD_PORT},
 }
 _lock = threading.Lock()
+
+# rolling telemetry history for the dashboard chart (~10 min at a 2 s cadence)
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "300"))
+_history = deque(maxlen=HISTORY_MAX)
+
+
+def _record(sysinfo, hr):
+    """Append one point to the history ring (called on each fresh reading)."""
+    s = sysinfo or {}
+    pt = {"ts": int(time.time()), "temp": s.get("temp"), "load1": s.get("load1"),
+          "bpm": (hr or {}).get("bpm")}
+    with _lock:
+        # de-dupe identical timestamps (board may repeat within a second)
+        if not _history or _history[-1]["ts"] != pt["ts"]:
+            _history.append(pt)
 
 
 def _get(url, timeout=2.5):
@@ -84,6 +100,8 @@ def poll_loop():
                 _state.update(conn="installer", sysinfo=None, hr=None)
             else:
                 _state.update(conn="offline", sysinfo=None, hr=None)
+        if sysinfo:
+            _record(sysinfo, hr)
         time.sleep(POLL_INTERVAL)
 
 
@@ -115,6 +133,7 @@ def serial_loop():
                     with _lock:
                         _state.update(conn="ready", sysinfo=obj.get("sysinfo"),
                                       hr=obj.get("hr"), last_ok=now, checked=now)
+                    _record(obj.get("sysinfo"), obj.get("hr"))
                 if len(buf) > 65536:
                     buf = b""                    # runaway guard on a garbled link
         except Exception:
@@ -162,6 +181,10 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 payload = dict(_state, age=round(time.time() - _state["checked"], 1))
             return self._send(200, json.dumps(payload), "application/json")
+        if self.path == "/api/history":
+            with _lock:
+                pts = list(_history)
+            return self._send(200, json.dumps({"points": pts}), "application/json")
         return self._send(404, json.dumps({"err": "not found"}), "application/json")
 
 
@@ -189,6 +212,9 @@ h1{font-size:19px;margin:0 0 2px}.sub{color:var(--mut);font-size:13px;margin-bot
 .leds{display:flex;gap:8px;margin-top:6px}.led{width:16px;height:16px;border-radius:50%;
   border:1px solid var(--line);opacity:.25}.led.on{opacity:1}
 .led.red{background:#e74c3c}.led.green{background:#2ecc71}.led.blue{background:#4aa3ff}
+.chart{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-top:12px}
+.chart .k{margin-bottom:8px}.chart svg{display:block;width:100%;height:120px;overflow:visible}
+.chart .cur{fill:var(--fg);font-size:13px;font-weight:600}.chart .ax{fill:var(--mut);font-size:11px}
 .guide{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-top:14px}
 .guide h3{margin:0 0 8px;font-size:15px}.guide code{background:#0d0f14;padding:2px 6px;border-radius:5px;
   color:var(--acc);font-size:13px}.guide ol{margin:8px 0 0 18px;padding:0}.guide li{margin:4px 0}
@@ -205,6 +231,28 @@ const $=id=>document.getElementById(id);
 function fmtUp(s){if(s==null)return'–';const d=s/86400|0,h=s%86400/3600|0,m=s%3600/60|0;
   return d?`${d}d ${h}h`:h?`${h}h ${m}m`:`${m}m`}
 function card(k,v){return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`}
+async function drawChart(){
+ const el=$('chart'); if(!el) return;
+ let pts;try{pts=(await (await fetch('/api/history')).json()).points}catch(e){return}
+ const el2=$('chart'); if(!el2) return;            // dashboard may have re-rendered
+ const xs=pts.filter(p=>p.temp!=null);
+ if(xs.length<2){el2.innerHTML='<div class="k">Temperature</div><div class="ax">collecting…</div>';return}
+ const W=680,H=120,P=6, vals=xs.map(p=>p.temp);
+ let lo=Math.min(...vals),hi=Math.max(...vals); if(hi-lo<1){hi+=0.5;lo-=0.5}
+ const x=i=>P+i*(W-2*P)/(xs.length-1), y=v=>P+(1-(v-lo)/(hi-lo))*(H-2*P);
+ const line=vals.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+ const area=`${P},${H-P} ${line} ${x(xs.length-1)},${H-P}`;
+ const cur=vals[vals.length-1], mins=Math.round((xs[xs.length-1].ts-xs[0].ts)/60);
+ el2.innerHTML=`<div class="k">Temperature · last ${mins||'<1'} min · via USB</div>
+  <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+   <polygon points="${area}" fill="rgba(74,163,255,.12)"/>
+   <polyline points="${line}" fill="none" stroke="var(--acc)" stroke-width="2"/>
+   <circle cx="${x(xs.length-1).toFixed(1)}" cy="${y(cur).toFixed(1)}" r="3" fill="var(--acc)"/>
+   <text class="cur" x="${(x(xs.length-1)-4).toFixed(1)}" y="${(y(cur)-8).toFixed(1)}" text-anchor="end">${cur}°C</text>
+   <text class="ax" x="2" y="12">${hi.toFixed(1)}</text>
+   <text class="ax" x="2" y="${H-2}">${lo.toFixed(1)}</text>
+  </svg>`;
+}
 async function tick(){
  let st;try{st=await (await fetch('/api/status')).json()}catch(e){return}
  const b=$('banner'),body=$('body');
@@ -226,7 +274,9 @@ async function tick(){
      ${card('Kernel','<small>'+(s.kernel||'–')+'</small>')}
      ${'<div class="card"><div class="k">LEDs</div><div class="leds">'+ledhtml+'</div></div>'}
      ${card('Heart rate',hr&&hr.bpm?hr.bpm+' <small>bpm</small>':'<small>'+((hr&&hr.state)||'idle')+'</small>')}
-   </div>`;
+   </div>
+   <div class="chart" id="chart"></div>`;
+   drawChart();
  }else if(st.conn==='installer'){
    $('btext').textContent='RECOVERY INSTALLER running — system not installed';
    body.innerHTML=`<div class="guide"><h3>The board booted its QSPI recovery installer</h3>
