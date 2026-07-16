@@ -233,6 +233,39 @@ def serial_send_file(data, name, apply_after):
             _ota.update(phase="done", ok=True, active=False, msg="received")
 
 
+def serial_provision(rfile, boot_size, rootfs_size):
+    """Stream a blank-SD install to the installer: boot files then the rootfs,
+    both read from the POST body and pushed to serial without buffering."""
+    total = boot_size + rootfs_size
+    with _lock:
+        _ota.update(active=True, name="provision", size=total, sent=0, recv=0,
+                    phase="send", ok=None, msg="", _put_ok=None)
+    _ser_write({"t": "provision", "boot_size": boot_size, "rootfs_size": rootfs_size})
+    sent = 0
+    remaining = total
+    while remaining > 0:
+        chunk = rfile.read(min(65536, remaining))
+        if not chunk:
+            break
+        _ser_write_raw(chunk)
+        sent += len(chunk); remaining -= len(chunk)
+        with _lock:
+            _ota["sent"] = sent
+    with _lock:
+        _ota.update(phase="apply")          # board is now partitioning + writing
+    # provisioning runs long; wait for apply_result via _dispatch
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        with _lock:
+            done = _ota["phase"] in ("done", "error")
+        if done:
+            break
+        time.sleep(0.5)
+    with _lock:
+        if _ota["phase"] not in ("done", "error"):
+            _ota.update(phase="error", ok=False, active=False, msg="provision timed out")
+
+
 def stale_watchdog():
     """Flag offline when no telemetry line has arrived for STALE_AFTER seconds."""
     while True:
@@ -283,8 +316,38 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, json.dumps({"err": "not found"}), "application/json")
 
     def do_POST(self):
+        path = self.path.split("?")[0]
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        # POST /api/provision?boot_size=B&rootfs_size=S  body = boot.tgz + rootfs.tar.gz
+        if path == "/api/provision":
+            if not SERIAL_DEV or _ser_fd is None:
+                return self._send(409, json.dumps({"err": "serial link not available"}), "application/json")
+            with _lock:
+                busy = _ota["active"]
+            if busy:
+                return self._send(409, json.dumps({"err": "busy"}), "application/json")
+            try:
+                bsz = int(q.get("boot_size", ["0"])[0]); rsz = int(q.get("rootfs_size", ["0"])[0])
+            except ValueError:
+                bsz = rsz = 0
+            if bsz <= 0 or rsz <= 0:
+                return self._send(400, json.dumps({"err": "boot_size & rootfs_size required"}), "application/json")
+            threading.Thread(target=serial_provision, args=(self.rfile, bsz, rsz),
+                             daemon=True).start()
+            # respond after the transfer thread finishes reading the body
+            deadline = time.time() + 2400
+            while time.time() < deadline:
+                with _lock:
+                    ph = _ota["phase"]
+                if ph in ("apply", "done", "error"):
+                    break
+                time.sleep(0.3)
+            with _lock:
+                o = {k: v for k, v in _ota.items() if not k.startswith("_")}
+            return self._send(200, json.dumps({"accepted": True, "ota": o}), "application/json")
         # POST /api/ota?name=<f>&apply=1  with the raw file as the request body.
-        if self.path.split("?")[0] != "/api/ota":
+        if path != "/api/ota":
             return self._send(404, json.dumps({"err": "not found"}), "application/json")
         if not SERIAL_DEV or _ser_fd is None:
             return self._send(409, json.dumps({"err": "serial link not available"}), "application/json")
@@ -292,8 +355,6 @@ class Handler(BaseHTTPRequestHandler):
             busy = _ota["active"]
         if busy:
             return self._send(409, json.dumps({"err": "transfer already in progress"}), "application/json")
-        from urllib.parse import urlparse, parse_qs
-        q = parse_qs(urlparse(self.path).query)
         name = os.path.basename(q.get("name", ["upload.swu"])[0]) or "upload.swu"
         apply_after = q.get("apply", ["0"])[0] in ("1", "true", "yes")
         try:

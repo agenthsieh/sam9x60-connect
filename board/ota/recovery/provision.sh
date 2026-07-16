@@ -1,27 +1,23 @@
 #!/bin/sh
-# provision.sh <payload.tar.gz> — install a fresh system onto a blank SD from
-# the recovery installer. The payload is a gzip tarball:
-#     boot/              files for the FAT boot partition (p1)
-#                        boot.bin, u-boot.bin, <kernel>.itb, uboot.env
-#     rootfs.tar.gz      the root filesystem (written to slot A=p2 and B=p3)
+# provision.sh — install a fresh system onto a blank SD from the recovery
+# installer. The board has only 128 MB RAM, far less than a rootfs, so the
+# rootfs is *streamed* straight onto the SD (never buffered): the caller pipes
+# a gzipped rootfs tar on stdin and we extract it on the fly.
 #
-# Partition map reproduces the stock SD exactly (fixed sectors, so p1 stays a
-# 16 MB FAT boot area and the A/B slots are 900 MB each):
-#     p1  2048     +32768    (16M) FAT32, bootable
-#     p2  34816    +1843200  (900M) ext4  slot A
-#     p3  1878016  +1843200  (900M) ext4  slot B
-#     p4  3721216  ..end     ext4  /data
+# Usage (from installer-agent.sh):
+#     provision.sh <boot_dir>  < rootfs.tar.gz
+#   <boot_dir>  a small dir already unpacked in tmpfs holding the FAT boot files
+#               (boot.bin, u-boot.bin, <kernel>.itb, uboot.env)
+#   stdin       the gzipped rootfs tarball, streamed
+#
+# Partition map reproduces the stock SD exactly:
+#   p1 2048 +32768 (16M) FAT bootable | p2/p3 900M ext4 A/B | p4 rest ext4
 set -e
-PAYLOAD="$1"
+BOOTDIR="$1"
 DISK=/dev/mmcblk0
-W=/tmp/prov
 log() { echo "[provision] $*"; }
 
-[ -f "$PAYLOAD" ] || { echo "no payload: $PAYLOAD"; exit 1; }
-rm -rf "$W"; mkdir -p "$W"
-log "unpacking payload"
-tar xzf "$PAYLOAD" -C "$W"
-[ -d "$W/boot" ] && [ -f "$W/rootfs.tar.gz" ] || { echo "bad payload layout"; exit 1; }
+[ -d "$BOOTDIR" ] || { echo "no boot dir: $BOOTDIR"; exit 1; }
 
 log "partitioning $DISK"
 sfdisk "$DISK" <<'PART'
@@ -33,7 +29,7 @@ start=1878016, size=1843200, type=83
 start=3721216, type=83
 PART
 sync; sleep 1
-sfdisk -R "$DISK" 2>/dev/null || true      # re-read partition table
+sfdisk -R "$DISK" 2>/dev/null || true
 sleep 1
 
 log "formatting"
@@ -42,16 +38,19 @@ for p in p2 p3 p4; do mke2fs -t ext4 -F -q "${DISK}${p}"; done
 
 log "writing boot (p1)"
 mkdir -p /mnt/p1; mount "${DISK}p1" /mnt/p1
-cp "$W"/boot/* /mnt/p1/
+cp "$BOOTDIR"/* /mnt/p1/
 sync; umount /mnt/p1
 
-log "writing rootfs to slots A + B"
+log "streaming rootfs to slot A (p2)"
 mkdir -p /mnt/r
-for p in p2 p3; do
-    mount "${DISK}${p}" /mnt/r
-    tar xzf "$W/rootfs.tar.gz" -C /mnt/r
-    sync; umount /mnt/r
-done
+mount "${DISK}p2" /mnt/r
+tar xz -C /mnt/r            # <-- rootfs.tar.gz streamed from stdin, not buffered
+sync
+
+log "cloning slot A -> slot B (p3)"
+mount "${DISK}p3" /mnt/rb 2>/dev/null || { mkdir -p /mnt/rb; mount "${DISK}p3" /mnt/rb; }
+cp -a /mnt/r/. /mnt/rb/
+sync; umount /mnt/rb; umount /mnt/r
 
 log "done"
 sync

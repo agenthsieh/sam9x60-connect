@@ -18,9 +18,12 @@ services:
     restart: unless-stopped
     security_opt:
       - seccomp=unconfined      # Synology's kernel rejects Docker's seccomp profile
-    user: "0:0"                 # read the root-owned /dev/ttyACM0 (serial mode)
-    devices:
-      - "${SERIAL_DEV:-/dev/ttyACM0}:${SERIAL_DEV:-/dev/ttyACM0}"
+    user: "0:0"                 # read the root-owned CDC-ACM node (serial mode)
+    # Bind-mount all of /dev rather than a single device node: a board reboot
+    # re-enumerates the CDC-ACM gadget and it can come back as ttyACM1/2/... —
+    # a static device mapping would then point at a stale node.
+    volumes:
+      - /dev:/dev
     ports:
       - "${HUB_PORT:-8091}:8091"
     environment:

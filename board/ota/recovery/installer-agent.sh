@@ -40,11 +40,27 @@ while true; do
       else
         printf '{"t":"put_result","ok":false,"err":"size %s!=%s"}\n' "$got" "$size" >&3
       fi ;;
+    *'"t":"provision"'*)
+      # Blank-SD install. boot files (small) buffer in tmpfs; the rootfs is
+      # streamed straight onto the SD (the board has only 128 MB RAM).
+      bsz=$(printf '%s' "$line" | sed -n 's/.*"boot_size":\([0-9]*\).*/\1/p')
+      rsz=$(printf '%s' "$line" | sed -n 's/.*"rootfs_size":\([0-9]*\).*/\1/p')
+      head -c "$bsz" <&3 > "$SPOOL/boot.tgz"
+      rm -rf /tmp/bootdir; mkdir -p /tmp/bootdir
+      tar xzf "$SPOOL/boot.tgz" -C /tmp/bootdir 2>/dev/null
+      rm -f "$SPOOL/boot.tgz"
+      printf '{"t":"inst","sd":"%s","phase":"provisioning"}\n' "$(sd_state)" >&3
+      if head -c "$rsz" <&3 | /sbin/provision.sh /tmp/bootdir >/tmp/prov.log 2>&1; then
+        printf '{"t":"apply_result","ok":true,"msg":"provisioned; rebooting"}\n' >&3
+        sync; sleep 1; reboot -f
+      else
+        printf '{"t":"apply_result","ok":false,"msg":"%s"}\n' \
+          "$(tail -1 /tmp/prov.log 2>/dev/null | tr -d '\"\\')" >&3
+      fi ;;
     *'"t":"apply"'*)
       name=$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"/]*\)".*/\1/p')
       if /sbin/provision.sh "$SPOOL/$name" >/tmp/prov.log 2>&1; then
-        printf '{"t":"apply_result","ok":true,"msg":"provisioned; rebooting"}\n' >&3
-        sync; sleep 1; reboot -f
+        printf '{"t":"apply_result","ok":true,"msg":"applied"}\n' >&3
       else
         printf '{"t":"apply_result","ok":false,"msg":"%s"}\n' \
           "$(tail -1 /tmp/prov.log 2>/dev/null | tr -d '\"\\')" >&3
